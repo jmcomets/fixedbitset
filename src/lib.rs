@@ -34,6 +34,86 @@ fn div_rem(x: usize, d: usize) -> (usize, usize)
     (x / d, x % d)
 }
 
+// 32 bytes = 8 32-bit values ~ half of L1 cache
+const STACK_USAGE: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum BitSetData {
+    Stack(([Block; STACK_USAGE], u8)), // Use stack instead of dynamic memory,
+    Dynamic(Vec<Block>),               // as long as the bitset is small.
+}
+
+impl BitSetData {
+    fn with_capacity(bits: usize) -> Self {
+        let (mut nb_blocks, rem) = div_rem(bits, BITS);
+        nb_blocks += (rem > 0) as usize;
+        if nb_blocks < STACK_USAGE {
+            Self::stack(nb_blocks)
+        } else {
+            Self::dynamic(nb_blocks)
+        }
+    }
+
+    fn stack(nb_blocks: usize) -> Self {
+        BitSetData::Stack(([0; STACK_USAGE], nb_blocks as u8))
+    }
+
+    fn dynamic(nb_blocks: usize) -> Self {
+        BitSetData::Dynamic(vec![0; nb_blocks])
+    }
+
+    fn grow(self, bits: usize) -> Self {
+        let (mut nb_blocks, rem) = div_rem(bits, BITS);
+        nb_blocks += (rem > 0) as usize;
+        let nb_blocks = nb_blocks;
+
+        match self {
+            BitSetData::Stack((blocks, _)) => {
+                if nb_blocks < STACK_USAGE {
+                    BitSetData::Stack((blocks, nb_blocks as u8))
+                } else {
+                    let mut new_blocks = vec![0; nb_blocks as usize];
+                    for (x, y) in new_blocks.iter_mut().zip(blocks.iter()) {
+                        *x |= *y;
+                    }
+                    BitSetData::Dynamic(new_blocks)
+                }
+            }
+
+            BitSetData::Dynamic(mut blocks) => {
+                blocks.resize(nb_blocks, 0);
+                BitSetData::Dynamic(blocks)
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for BitSetData {
+    type Target = [Block];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            BitSetData::Stack((blocks, nb_blocks)) => &blocks[..(*nb_blocks as usize)],
+            BitSetData::Dynamic(blocks)            => blocks,
+        }
+    }
+}
+
+impl std::ops::DerefMut for BitSetData {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            BitSetData::Stack((blocks, nb_blocks)) => &mut blocks[..(*nb_blocks as usize)],
+            BitSetData::Dynamic(blocks)            => &mut blocks[..],
+        }
+    }
+}
+
+impl Default for BitSetData {
+    fn default() -> Self {
+        Self::dynamic(0)
+    }
+}
+
 /// `FixedBitSet` is a simple fixed size set of bits that each can
 /// be enabled (1 / **true**) or disabled (0 / **false**).
 ///
@@ -41,8 +121,8 @@ fn div_rem(x: usize, d: usize) -> (usize, usize)
 /// capacity can grow using the `grow` method).
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct FixedBitSet {
-    data: Vec<Block>,
-    /// length in bits
+    data: BitSetData,
+    /// length in bits (why is this needed?)
     length: usize,
 }
 
@@ -52,21 +132,16 @@ impl FixedBitSet
     /// all initially clear.
     pub fn with_capacity(bits: usize) -> Self
     {
-        let (mut blocks, rem) = div_rem(bits, BITS);
-        blocks += (rem > 0) as usize;
         FixedBitSet {
-            data: vec![0; blocks],
+            data: BitSetData::with_capacity(bits),
             length: bits,
         }
     }
-    
+
     /// Grow capacity to **bits**, all new bits initialized to zero
     pub fn grow(&mut self, bits: usize) {
-        let (mut blocks, rem) = div_rem(bits, BITS);
-        blocks += (rem > 0) as usize;
-        if bits > self.length {
-            self.length = bits;
-            self.data.resize(blocks, 0);
+        if bits > self.len() {
+            self.data = self.data.grow(bits);
         }
     }
 
@@ -83,10 +158,14 @@ impl FixedBitSet
     #[inline]
     pub fn contains(&self, bit: usize) -> bool
     {
-        let (block, i) = div_rem(bit, BITS);
-        match self.data.get(block) {
-            None => false,
-            Some(b) => (b & (1 << i)) != 0,
+        if bit < self.len() {
+            let (block, i) = div_rem(bit, BITS);
+            unsafe {
+                let b = self.data.get_unchecked(block);
+                (b & (1 << i)) != 0
+            }
+        } else {
+            false
         }
     }
 
@@ -105,7 +184,7 @@ impl FixedBitSet
     #[inline]
     pub fn insert(&mut self, bit: usize)
     {
-        assert!(bit < self.length);
+        assert!(bit < self.len());
         let (block, i) = div_rem(bit, BITS);
         unsafe {
             *self.data.get_unchecked_mut(block) |= 1 << i;
@@ -118,7 +197,7 @@ impl FixedBitSet
     #[inline]
     pub fn put(&mut self, bit: usize) -> bool
     {
-        assert!(bit < self.length);
+        assert!(bit < self.len());
         let (block, i) = div_rem(bit, BITS);
         unsafe {
             let word = self.data.get_unchecked_mut(block);
@@ -132,7 +211,7 @@ impl FixedBitSet
     #[inline]
     pub fn set(&mut self, bit: usize, enabled: bool)
     {
-        assert!(bit < self.length);
+        assert!(bit < self.len());
         let (block, i) = div_rem(bit, BITS);
         unsafe {
             let elt = self.data.get_unchecked_mut(block);
@@ -150,7 +229,7 @@ impl FixedBitSet
     #[inline]
     pub fn copy_bit(&mut self, from: usize, to: usize)
     {
-        assert!(to < self.length);
+        assert!(to < self.len());
         let (to_block, t) = div_rem(to, BITS);
         let enabled = self.contains(from);
         unsafe {
@@ -171,7 +250,7 @@ impl FixedBitSet
     #[inline]
     pub fn count_ones<T: IndexRange>(&self, range: T) -> usize
     {
-        Masks::new(range, self.length)
+        Masks::new(range, self.len())
             .map(|(block, mask)| unsafe {
                 let value = *self.data.get_unchecked(block);
                 (value & mask).count_ones() as usize
@@ -187,7 +266,7 @@ impl FixedBitSet
     #[inline]
     pub fn set_range<T: IndexRange>(&mut self, range: T, enabled: bool)
     {
-        for (block, mask) in Masks::new(range, self.length) {
+        for (block, mask) in Masks::new(range, self.len()) {
             unsafe {
                 if enabled {
                     *self.data.get_unchecked_mut(block) |= mask;
@@ -213,7 +292,7 @@ impl FixedBitSet
     #[inline]
     pub fn as_slice(&self) -> &[u32]
     {
-        &self.data
+        &self.data[..]
     }
 
     /// View the bitset as a mutable slice of `u32` blocks. Writing past the bitlength in the last
@@ -221,7 +300,7 @@ impl FixedBitSet
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u32]
     {
-        &mut self.data
+        &mut self.data[..]
     }
 
     /// Iterates over all enabled bits.
@@ -288,8 +367,8 @@ impl FixedBitSet
     /// In-place union of two `FixedBitSet`s.
     pub fn union_with(&mut self, other: &FixedBitSet)
     {
-        if other.len() >= self.len() {
-            self.grow(other.len());
+        if other.length >= self.len() {
+            self.grow(other.length);
         }
         for (x, y) in self.data.iter_mut().zip(other.data.iter()) {
             *x |= *y;
@@ -302,7 +381,7 @@ impl FixedBitSet
         for (x, y) in self.data.iter_mut().zip(other.data.iter()) {
             *x &= *y;
         }
-        let mn = std::cmp::min(self.data.len(), other.data.len());
+        let mn = std::cmp::min(self.len(), other.length);
         for wd in &mut self.data[mn..] {
            *wd = 0;
         }
@@ -311,8 +390,8 @@ impl FixedBitSet
     /// In-place symmetric difference of two `FixedBitSet`s.
     pub fn symmetric_difference_with(&mut self, other: &FixedBitSet)
     {
-        if other.len() >= self.len() {
-            self.grow(other.len());
+        if other.length >= self.len() {
+            self.grow(other.length);
         }
         for (x, y) in self.data.iter_mut().zip(other.data.iter()) {
             *x ^= *y;
@@ -329,7 +408,7 @@ impl FixedBitSet
     /// at least all the values in `self`.
     pub fn is_subset(&self, other: &FixedBitSet) -> bool {
         self.data.iter().zip(other.data.iter()).all(|(x, y)| x & !y == 0) &&
-        self.data.iter().skip(other.data.len()).all(|x| *x == 0)
+        self.data.iter().skip(other.length).all(|x| *x == 0)
     }
 
     /// Returns `true` if the set is a superset of another, i.e. `self` contains
@@ -528,7 +607,7 @@ impl Clone for FixedBitSet
     {
         FixedBitSet {
             data: self.data.clone(),
-            length: self.length,
+            length: self.len(),
         }
     }
 }
@@ -583,7 +662,7 @@ impl <'a> BitAnd for &'a FixedBitSet
     type Output = FixedBitSet;
     fn bitand(self, other: &FixedBitSet) -> FixedBitSet {
         let (short, long) = {
-            if self.len() <= other.len() {
+            if self.len() <= other.length {
                 (&self.data, &other.data)
             } else {
                 (&other.data, &self.data)
@@ -593,7 +672,7 @@ impl <'a> BitAnd for &'a FixedBitSet
         for (data, block) in data.iter_mut().zip(long.iter()) {
             *data &= *block;
         }
-        let len = std::cmp::min(self.len(), other.len());
+        let len = std::cmp::min(self.len(), other.length);
         FixedBitSet{data: data, length: len}
     }
 }
@@ -611,7 +690,7 @@ impl <'a> BitOr for &'a FixedBitSet
     type Output = FixedBitSet;
     fn bitor(self, other: &FixedBitSet) -> FixedBitSet {
         let (short, long) = {
-            if self.len() <= other.len() {
+            if self.len() <= other.length {
                 (&self.data, &other.data)
             } else {
                 (&other.data, &self.data)
@@ -621,7 +700,7 @@ impl <'a> BitOr for &'a FixedBitSet
         for (data, block) in data.iter_mut().zip(short.iter()) {
             *data |= *block;
         }
-        let len = std::cmp::max(self.len(), other.len());
+        let len = std::cmp::max(self.len(), other.length);
         FixedBitSet{data: data, length: len}
     }
 }
@@ -638,7 +717,7 @@ impl <'a> BitXor for &'a FixedBitSet
     type Output = FixedBitSet;
     fn bitxor(self, other: &FixedBitSet) -> FixedBitSet {
         let (short, long) = {
-            if self.len() <= other.len() {
+            if self.len() <= other.length {
                 (&self.data, &other.data)
             } else {
                 (&other.data, &self.data)
@@ -648,7 +727,7 @@ impl <'a> BitXor for &'a FixedBitSet
         for (data, block) in data.iter_mut().zip(short.iter()) {
             *data ^= *block;
         }
-        let len = std::cmp::max(self.len(), other.len());
+        let len = std::cmp::max(self.len(), other.length);
         FixedBitSet{data: data, length: len}
     }
 }
