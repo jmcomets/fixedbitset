@@ -17,7 +17,8 @@ use core as std;
 
 mod range;
 
-use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Index};
+use std::mem;
+use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Index, Deref, DerefMut};
 use std::cmp::{Ord, Ordering};
 use std::iter::{Chain, FromIterator};
 pub use range::IndexRange;
@@ -28,6 +29,9 @@ static FALSE: bool = false;
 const BITS: usize = 32;
 type Block = u32;
 
+// If computing `div_rem(n, m)` where m is a power of 2:
+//   Remainder = `n & (m-1)`
+//   Quotient = `(n >> log2(m))`
 #[inline]
 fn div_rem(x: usize, d: usize) -> (usize, usize)
 {
@@ -62,33 +66,32 @@ impl BitSetData {
         BitSetData::Dynamic(vec![0; nb_blocks])
     }
 
-    fn grow(self, bits: usize) -> Self {
+    fn grow(&mut self, bits: usize) {
         let (mut nb_blocks, rem) = div_rem(bits, BITS);
         nb_blocks += (rem > 0) as usize;
-        let nb_blocks = nb_blocks;
+        let new_nb_blocks = nb_blocks;
 
         match self {
-            BitSetData::Stack((blocks, _)) => {
-                if nb_blocks < STACK_USAGE {
-                    BitSetData::Stack((blocks, nb_blocks as u8))
-                } else {
-                    let mut new_blocks = vec![0; nb_blocks as usize];
-                    for (x, y) in new_blocks.iter_mut().zip(blocks.iter()) {
-                        *x |= *y;
-                    }
-                    BitSetData::Dynamic(new_blocks)
+            BitSetData::Stack((_, nb_blocks)) => {
+                if new_nb_blocks < STACK_USAGE {
+                    *nb_blocks = new_nb_blocks as u8;
+                    return;
                 }
             }
 
-            BitSetData::Dynamic(mut blocks) => {
-                blocks.resize(nb_blocks, 0);
-                BitSetData::Dynamic(blocks)
+            BitSetData::Dynamic(blocks) => {
+                blocks.resize(new_nb_blocks, 0);
+                return;
             }
         }
+
+        let mut new_blocks: Vec<_> = self.iter().cloned().collect();
+        new_blocks.resize(new_nb_blocks, 0);
+        mem::replace(self, BitSetData::Dynamic(new_blocks));
     }
 }
 
-impl std::ops::Deref for BitSetData {
+impl Deref for BitSetData {
     type Target = [Block];
 
     fn deref(&self) -> &Self::Target {
@@ -99,7 +102,7 @@ impl std::ops::Deref for BitSetData {
     }
 }
 
-impl std::ops::DerefMut for BitSetData {
+impl DerefMut for BitSetData {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
             BitSetData::Stack((blocks, nb_blocks)) => &mut blocks[..(*nb_blocks as usize)],
@@ -141,7 +144,7 @@ impl FixedBitSet
     /// Grow capacity to **bits**, all new bits initialized to zero
     pub fn grow(&mut self, bits: usize) {
         if bits > self.len() {
-            self.data = self.data.grow(bits);
+            self.data.grow(bits);
         }
     }
 
